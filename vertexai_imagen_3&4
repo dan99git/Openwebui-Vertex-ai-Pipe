@@ -1,0 +1,1455 @@
+
+"""
+title: Vertex AI Imagen 3/4 Hybrid
+author: Daniel Parsons
+date: 2024-07-23
+description: A Manifold function that integrates Google's Vertex AI Platform with the Imagen 3 and 4 models. Requires authentication via a Service Account using a .JSON credentials file set through a valve configuration. Supports configurable aspect ratios, watermark control, image count (1-4), negative prompt, prompt enhancement, output format (JPEG/PNG), JPEG quality via valve and prompt syntax (--param: value), image upscaling (--mode: upscale --upscale-factor: x2/x4), and chained generate-then-upscale (--upscale-after-generate: x2/x4). Note: Imagen 4 models do not support upscaling or negative prompts; these parameters will be ignored if an Imagen 4 model is selected and the corresponding valve is enabled.
+options: Supports configurable aspect ratios, watermark control, image count (1-4), negative prompt, prompt enhancement, output format (JPEG/PNG), JPEG quality via valve and prompt syntax (--param: value), image upscaling (--mode: upscale --upscale-factor: x2/x4), and chained generate-then-upscale (--upscale-after-generate: x2/x4). Note: Imagen 4 models do not support upscaling or negative prompts; these parameters will be ignored if an Imagen 4 model is selected and the corresponding valve is enabled.
+funding_url: https://github.com/open-webui
+documentation_url: https:www.intraweb.net/docs/OpenWebUI-Function-VertexAI-Imagen3.pdf
+license: MIT
+version: 1.1.1
+"""
+
+import base64
+import json
+import logging
+import re
+import time
+import uuid
+from typing import List, Dict, Any, Optional, Callable, Awaitable, Literal, Union
+import httpx
+from fastapi import Request
+from pydantic import BaseModel, Field, PrivateAttr
+from starlette.responses import StreamingResponse
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
+
+
+class Pipe:
+    class Valves(BaseModel):
+        PROJECT_ID: str = Field(default="", description="Your Google Cloud Project ID")
+        LOCATION_ID: str = Field(
+            default="us-central1",
+            description="The Google Cloud location (e.g., us-central1)",
+        )
+        SERVICE_ACCOUNT_KEY_FILE_PATH: str = Field(
+            default="",
+            description="Absolute path to your Google Cloud Service Account JSON key file INSIDE the container (e.g., /app/service-account-key.json)",
+        )
+        API_BASE_URL: str = Field(
+            default="https://us-central1-aiplatform.googleapis.com",
+            description="Vertex AI API base URL (e.g., https://us-central1-aiplatform.googleapis.com). MUST match Location ID.",
+        )
+        MODEL: Literal[
+            "imagen-3.0-generate-002",
+            "imagen-4.0-ultra-generate-preview-06-06",
+            "imagen-4.0-generate-preview-06-06",
+            "imagen-4.0-fast-generate-preview-06-06",
+        ] = Field(
+            default="imagen-3.0-generate-002",
+            description="Select the Imagen model. Note: Imagen 4 models do not support upscaling or negative prompts; these parameters will be ignored if an Imagen 4 model is selected and the corresponding valve is enabled.",
+        )
+        IMAGE_COUNT: int = Field(
+            default=1,
+            description="Default number of images to generate (1-4). Only applies to generation mode. Can be overridden in prompt (--count: 3). Imagen 4 Ultra/Standard is limited to 1.",
+            ge=1,
+            le=4,
+        )
+        ASPECT_RATIO: Literal[
+            "1:1 (1024x1024)",
+            "16:9 (1408x768)",
+            "9:16 (768x1408)",
+            "3:4 (896x1280)",
+            "4:3 (1280x896)",
+        ] = Field(
+            default="1:1 (1024x1024)",
+            description="Default aspect ratio for generated image(s). Only applies to generation mode. Can be overridden in prompt (--aspect-ratio: 1:1). All Imagen 4 models support these ratios.",
+        )
+        REQUEST_TIMEOUT: int = Field(
+            default=120, description="Request timeout in seconds"
+        )
+        ADD_WATERMARK: bool = Field(
+            default=False,
+            description="Whether to enable a watermark for generated images. Set to False to use seed. Applies to both generation and upscale. Can be overridden in prompt (--add-watermark: true/false). All Imagen models support this.",
+        )
+        OUTPUT_MIME_TYPE: Literal["image/png", "image/jpeg"] = Field(
+            default="image/jpeg",
+            description="Default output image format (PNG/JPEG). Applies to both generation and upscale. Can be overridden in prompt (--mime-type: jpeg/png). All Imagen models support this.",
+        )
+        JPEG_QUALITY: int = Field(
+            default=90,
+            description="Default JPEG quality (10-100), only used for JPEG output. Applies to both generation and upscale. Can be overridden in prompt (--quality: 90). All Imagen models support this.",
+            ge=10,
+            le=100,
+        )
+        UPSCALE_FACTOR: Literal["x2", "x4"] = Field(
+            default="x2",
+            description="Default upscale factor (x2 or x4). Only applies to upscale mode or generate-then-upscale with Imagen 3. Ignored for Imagen 4 models. Can be overridden in prompt (--upscale-factor: x4 or --upscale-after-generate: x4).",
+        )
+        DISABLE_UNSUPPORTED_FEATURES_FOR_IMAGEN4: bool = Field(
+            default=True,
+            description="When True, automatically disables and ignores unsupported features (like upscaling and negative prompts) when an Imagen 4 model is selected, preventing API errors. Set to False to send all parameters to the API, which may result in errors for Imagen 4.",
+        )
+        PERSON_GENERATION: Literal["dont_allow", "allow_adult", "allow_all"] = Field(
+            default="allow_adult",
+            description="Allow generation of people by the model. 'dont_allow', 'allow_adult', 'allow_all'. Default is 'allow_adult'. Can be overridden in prompt (--person-generation: allow_all).",
+        )
+        SAFETY_SETTING: Literal[
+            "block_low_and_above",
+            "block_medium_and_above",
+            "block_only_high",
+            "block_none",
+        ] = Field(
+            default="block_medium_and_above",
+            description="Adds a filter level to safety filtering. 'block_low_and_above', 'block_medium_and_above', 'block_only_high', 'block_none'. Default is 'block_medium_and_above'. Access to 'block_none' is restricted. Can be overridden in prompt (--safety-setting: block_none).",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.emitter: Optional[Callable[[dict], Awaitable[None]]] = None
+
+    async def emit_status(
+        self, message: str, done: bool = False, show_in_chat: bool = False
+    ):
+        """Emit status updates to the client."""
+        if self.emitter:
+            await self.emitter(
+                {"type": "status", "data": {"description": message, "done": done}}
+            )
+        if show_in_chat:
+            if done:
+                return f"**✅ {message}**\n\n"
+            else:
+                return f"**⏳ {message}**\n\n"
+        return ""
+
+    async def pipes(self) -> List[dict]:
+        return [
+            {
+                "id": "imagen34",
+                "name": "Vertex AI Imagen 3/4",
+            }
+        ]
+
+    def _extract_prompt_and_image(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        prompt = ""
+        latest_image_data_b64 = None
+        latest_image_mime_type = None
+
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+
+            content = message.get("content", "")
+
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        prompt += item.get("text", "") + " "
+                    elif item.get("type") == "image_url":
+                        image_url_data = item.get("image_url", {})
+                        if isinstance(image_url_data, dict):
+                            if image_url_data.get("url", "").startswith("data:"):
+                                try:
+                                    match = re.match(
+                                        r"data:(.*?);base64,(.*)",
+                                        image_url_data["url"],
+                                    )
+                                    if match:
+                                        latest_image_mime_type = match.group(1)
+                                        latest_image_data_b64 = match.group(2)
+                                        logging.info(
+                                            f"Extracted base64 image data from user message with mime type: {latest_image_mime_type}"
+                                        )
+
+                                except Exception as e:
+                                    logging.error(
+                                        f"Error extracting base64 from data URL: {e}"
+                                    )
+
+                    elif item.get("type") == "image":
+                        image_data = item.get("image", {})
+                        if isinstance(image_data, dict) and "url" in image_data:
+                            if image_data["url"].startswith("data:"):
+                                try:
+                                    match = re.match(
+                                        r"data:(.*?);base64,(.*)", image_data["url"]
+                                    )
+                                    if match:
+                                        latest_image_mime_type = match.group(1)
+                                        latest_image_data_b64 = match.group(2)
+                                        logging.info(
+                                            f"Extracted base64 image data from user message with mime type: {latest_image_mime_type} (from 'image' type)"
+                                        )
+                                except Exception as e:
+                                    logging.error(
+                                        f"Error extracting base64 from data URL (image type): {e}"
+                                    )
+
+            elif isinstance(content, str):
+                prompt += content + " "
+                if latest_image_data_b64 is None:
+                    image_url_data = message.get("image_url", {})
+                    if isinstance(image_url_data, dict) and image_url_data.get(
+                        "url", ""
+                    ).startswith("data:"):
+                        try:
+                            match = re.match(
+                                r"data:(.*?);base64,(.*)", image_url_data["url"]
+                            )
+                            if match:
+                                latest_image_mime_type = match.group(1)
+                                latest_image_data_b64 = match.group(2)
+                                logging.info(
+                                    f"Extracted base64 image data from user message with mime type: {latest_image_mime_type} (from message 'image_url' key)"
+                                )
+                        except Exception as e:
+                            logging.error(
+                                f"Error extracting base64 from message 'image_url' key: {e}"
+                            )
+
+                if latest_image_data_b64 is None:
+                    image_data = message.get("image", {})
+                    if (
+                        isinstance(image_data, dict)
+                        and "url" in image_data
+                        and image_data["url"].startswith("data:")
+                    ):
+                        try:
+                            match = re.match(
+                                r"data:(.*?);base64,(.*)", image_data["url"]
+                            )
+                            if match:
+                                latest_image_mime_type = match.group(1)
+                                latest_image_data_b64 = match.group(2)
+                                logging.info(
+                                    f"Extracted base64 image data from user message with mime type: {latest_image_mime_type} (from message 'image' key)"
+                                )
+                        except Exception as e:
+                            logging.error(
+                                f"Error extracting base64 from message 'image' key: {e}"
+                            )
+        return prompt.strip(), latest_image_data_b64, latest_image_mime_type
+
+    async def _parse_prompt_parameters(self, raw_prompt: str) -> tuple[str, dict]:
+        clean_prompt = raw_prompt
+        extracted_params = {}
+        patterns = {
+            "negative_prompt": r"--negative-prompt:\s*(.*?)(?:\s*--|$)",
+            "count": r"--count:\s*(\d+)(?:\s*--|$)",
+            "aspect_ratio": r"--aspect-ratio:\s*([0-9]+:[0-9]+)(?:\s*--|$)",
+            "enhance_prompt": r"--enhance-prompt:\s*(true|false)(?:\s*--|$)",
+            "add_watermark": r"--add-watermark:\s*(true|false)(?:\s*--|$)",
+            "seed": r"--seed:\s*(\d+)(?:\s*--|$)",
+            "mime_type": r"--mime-type:\s*(png|jpeg)(?:\s*--|$)",
+            "quality": r"--quality:\s*(\d+)(?:\s*--|$)",
+            "mode": r"--mode:\s*(generate|upscale)(?:\s*--|$)",
+            "upscale_factor": r"--upscale-factor:\s*(x2|x4)(?:\s*--|$)",
+            "upscale_after_generate": r"--upscale-after-generate:\s*(x2|x4)(?:\s*--|$)",
+            "person_generation": r"--person-generation:\s*(dont_allow|allow_adult|allow_all)(?:\s*--|$)",
+            "safety_setting": r"--safety-setting:\s*(block_low_and_above|block_medium_and_above|block_only_high|block_none)(?:\s*--|$)",
+        }
+        matches = []
+        for key, pattern in patterns.items():
+            for match in re.finditer(pattern, raw_prompt, re.IGNORECASE | re.DOTALL):
+                matches.append(
+                    (match.start(), match.end(), key, match.group(1).strip())
+                )
+        matches.sort(key=lambda x: x[0])
+        processed_segments = []
+        last_end = 0
+        for start, end, key, value in matches:
+            processed_segments.append(raw_prompt[last_end:start])
+            last_end = end
+            extracted_params[key] = value
+        processed_segments.append(raw_prompt[last_end:])
+        clean_prompt = "".join(processed_segments).strip()
+        final_params = {}
+        if "negative_prompt" in extracted_params:
+            final_params["negativePrompt"] = extracted_params["negative_prompt"]
+        if "count" in extracted_params:
+            try:
+                count = int(extracted_params["count"])
+                if 1 <= count <= 4:
+                    final_params["sampleCount"] = count
+                else:
+                    logging.warning(
+                        f"Invalid image count in prompt: {count}. Must be 1-4. Ignoring."
+                    )
+                    await self.emit_status(
+                        f"⚠️ Invalid count in prompt ({count}). Must be 1-4. Using default/valve.",
+                        show_in_chat=False,
+                    )
+            except ValueError:
+                logging.warning(
+                    f"Could not parse image count from prompt: '{extracted_params['count']}'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid count format in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+        valid_ratios = ["1:1", "16:9", "9:16", "3:4", "4:3"]
+        if "aspect_ratio" in extracted_params:
+            ratio = extracted_params["aspect_ratio"]
+            if ratio in valid_ratios:
+                final_params["aspectRatio"] = ratio
+            else:
+                logging.warning(
+                    f"Invalid aspect ratio in prompt: '{ratio}'. Must be one of {valid_ratios}. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid aspect ratio in prompt ({ratio}). Using default/valve.",
+                    show_in_chat=False,
+                )
+        if "enhance_prompt" in extracted_params:
+            value_lower = extracted_params["enhance_prompt"].lower()
+            if value_lower == "true":
+                final_params["enhancePrompt"] = True
+            elif value_lower == "false":
+                final_params["enhancePrompt"] = False
+            else:
+                logging.warning(
+                    f"Could not parse boolean for enhance-prompt from prompt: '{extracted_params['enhance_prompt']}'. Must be 'true' or 'false'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid enhance-prompt format in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+        if "add_watermark" in extracted_params:
+            value_lower = extracted_params["add_watermark"].lower()
+            if value_lower == "true":
+                final_params["addWatermark"] = True
+            elif value_lower == "false":
+                final_params["addWatermark"] = False
+            else:
+                logging.warning(
+                    f"Could not parse boolean for add-watermark from prompt: '{extracted_params['add_watermark']}'. Must be 'true' or 'false'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid add-watermark format in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+        if "seed" in extracted_params:
+            try:
+                seed = int(extracted_params["seed"])
+                final_params["seed"] = seed
+            except ValueError:
+                logging.warning(
+                    f"Could not parse integer for seed from prompt: '{extracted_params['seed']}'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid seed format in prompt. Ignoring.", show_in_chat=False
+                )
+        if "mime_type" in extracted_params:
+            mime_type_value = extracted_params["mime_type"].lower()
+            if mime_type_value == "png":
+                final_params["mimeType"] = "image/png"
+            elif mime_type_value == "jpeg":
+                final_params["mimeType"] = "image/jpeg"
+            else:
+                logging.warning(
+                    f"Invalid mime type in prompt: '{extracted_params['mime_type']}'. Must be 'png' or 'jpeg'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid mime-type in prompt ({extracted_params['mime_type']}). Using default/valve.",
+                    show_in_chat=False,
+                )
+        if "quality" in extracted_params:
+            try:
+                quality_value = int(extracted_params["quality"])
+                if 0 <= quality_value <= 100:
+                    final_params["quality"] = quality_value
+                else:
+                    logging.warning(
+                        f"Invalid quality in prompt: {quality_value}. Must be 0-100. Ignoring."
+                    )
+                    await self.emit_status(
+                        f"⚠️ Invalid quality in prompt ({quality_value}). Must be 0-100. Using default/valve.",
+                        show_in_chat=False,
+                    )
+            except ValueError:
+                logging.warning(
+                    f"Could not parse quality from prompt: '{extracted_params['quality']}'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid quality format in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+        if "mode" in extracted_params:
+            mode_value = extracted_params["mode"].lower()
+            if mode_value in ["generate", "upscale"]:
+                final_params["mode"] = mode_value
+            else:
+                logging.warning(
+                    f"Invalid mode in prompt: '{extracted_params['mode']}'. Must be 'generate' or 'upscale'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid mode in prompt ({extracted_params['mode']}). Using default (generate).",
+                    show_in_chat=False,
+                )
+
+        if "upscale_factor" in extracted_params:
+            factor_value = extracted_params["upscale_factor"].lower()
+            if factor_value in ["x2", "x4"]:
+                final_params["upscaleFactor"] = factor_value
+            else:
+                logging.warning(
+                    f"Invalid upscale factor in prompt: '{extracted_params['upscale_factor']}'. Must be 'x2' or 'x4'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid upscale factor in prompt ({extracted_params['upscale_factor']}). Must be 'x2' or 'x4'. Using default/valve.",
+                    show_in_chat=False,
+                )
+
+        if "upscale_after_generate" in extracted_params:
+            factor_value = extracted_params["upscale_after_generate"].lower()
+            if factor_value in ["x2", "x4"]:
+                final_params["upscaleAfterGenerate"] = factor_value
+                final_params["mode"] = (
+                    "generate"  # Upscale after implies generate first
+                )
+                if (
+                    "mode" in extracted_params
+                    and extracted_params["mode"].lower() == "upscale"
+                ):
+                    logging.warning(
+                        "Conflicting modes specified: --mode: upscale and --upscale-after-generate. --upscale-after-generate takes precedence."
+                    )
+                    await self.emit_status(
+                        f"⚠️ Conflicting modes in prompt. Using generate-then-upscale.",
+                        show_in_chat=False,
+                    )
+            else:
+                logging.warning(
+                    f"Invalid upscale factor for upscale-after-generate in prompt: '{extracted_params['upscale_after_generate']}'. Must be 'x2' or 'x4'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid upscale-after-generate factor in prompt ({extracted_params['upscale_after_generate']}). Must be 'x2' or 'x4'. Ignoring.",
+                    show_in_chat=False,
+                )
+
+        if "person_generation" in extracted_params:
+            pg_value = extracted_params["person_generation"].lower()
+            if pg_value in ["dont_allow", "allow_adult", "allow_all"]:
+                final_params["personGeneration"] = pg_value
+            else:
+                logging.warning(
+                    f"Invalid person generation value in prompt: '{extracted_params['person_generation']}'. Must be 'dont_allow', 'allow_adult', or 'allow_all'. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid person-generation in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+
+        if "safety_setting" in extracted_params:
+            ss_value = extracted_params["safety_setting"].lower()
+            if ss_value in [
+                "block_low_and_above",
+                "block_medium_and_above",
+                "block_only_high",
+                "block_none",
+            ]:
+                final_params["safetySetting"] = ss_value
+            else:
+                logging.warning(
+                    f"Invalid safety setting value in prompt: '{extracted_params['safety_setting']}'. Must be one of the supported values. Ignoring."
+                )
+                await self.emit_status(
+                    f"⚠️ Invalid safety-setting in prompt. Using default/valve.",
+                    show_in_chat=False,
+                )
+
+        return clean_prompt, final_params
+
+    async def pipe(
+        self,
+        body: dict,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        **kwargs,
+    ) -> StreamingResponse:
+        self.emitter = __event_emitter__
+        project_id = self.valves.PROJECT_ID
+        location_id = self.valves.LOCATION_ID
+        api_base_url = self.valves.API_BASE_URL.rstrip("/")
+        service_account_key_path = self.valves.SERVICE_ACCOUNT_KEY_FILE_PATH
+        model_id = self.valves.MODEL
+        request_timeout = self.valves.REQUEST_TIMEOUT
+        vertex_ai_url = (
+            f"{api_base_url}/v1/projects/{project_id}/locations/{location_id}/"
+            f"publishers/google/models/{model_id}:predict"
+        )
+        # Determine if the selected model is an Imagen 4 model
+        is_imagen4 = model_id.startswith("imagen-4.0")
+
+        async def stream_response():
+            is_stream = body.get(
+                "stream", False
+            )  # Define is_stream early for error formatting
+
+            credentials = None
+            logging.info(
+                f"Attempting to load Service Account credentials from path configured in Valve: '{service_account_key_path}'"
+            )
+            if not service_account_key_path:
+                yield self._format_data(
+                    is_stream=is_stream,
+                    content="Error: Service Account Key File Path not provided in Pipe Valves. Please configure this valve.",
+                )
+                await self.emit_status("❌ SA Key path missing", True, True)
+                if is_stream:  # Always send final chunk for stream
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+                return
+            try:
+                credentials = service_account.Credentials.from_service_account_file(
+                    service_account_key_path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                logging.info("Service Account credentials loaded successfully.")
+            except FileNotFoundError:
+                logging.error(
+                    f"Service Account key file not found at path: '{service_account_key_path}'. Check Valve setting and volume mount.",
+                    exc_info=True,
+                )
+                yield self._format_data(
+                    is_stream=is_stream,
+                    content=f"Error: Service Account key file not found at path: '{service_account_key_path}'. Check Valve setting and volume mount.",
+                )
+                await self.emit_status("❌ SA Key file not found", True, True)
+                if is_stream:
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+                return
+            except json.JSONDecodeError:
+                logging.error(
+                    f"Service Account key file at path '{service_account_key_path}' is not valid JSON. Check file content.",
+                    exc_info=True,
+                )
+                yield self._format_data(
+                    is_stream=is_stream,
+                    content=f"Error: Service Account key file at path '{service_account_key_path}' is not valid JSON. Check file content.",
+                )
+                await self.emit_status("❌ SA key invalid JSON", True, True)
+                if is_stream:
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+                return
+            except Exception as e:
+                logging.error(
+                    f"An unexpected error occurred loading Service Account credentials from path '{service_account_key_path}': {e}",
+                    exc_info=True,
+                )
+                yield self._format_data(
+                    is_stream=is_stream,
+                    content=f"Error: An unexpected error occurred loading Service Account credentials: {e}",
+                )
+                await self.emit_status("❌ SA credentials error", True, True)
+                if is_stream:
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+                return
+            if not credentials:
+                yield self._format_data(
+                    is_stream=is_stream,
+                    content="Error: Service Account credentials failed to load for unknown reason.",
+                )
+                await self.emit_status("❌ SA credentials failed", True, True)
+                if is_stream:
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+                return
+
+            try:
+                messages = body.get("messages", [])
+
+                raw_prompt, input_image_b64, input_image_mime_type = (
+                    self._extract_prompt_and_image(messages)
+                )
+                prompt, extracted_params = await self._parse_prompt_parameters(
+                    raw_prompt
+                )
+
+                # --- Parameter Determination (Initial) ---
+                upscale_after_generate_factor = extracted_params.get(
+                    "upscaleAfterGenerate"
+                )
+
+                mode_to_use = extracted_params.get("mode", body.get("mode", "generate"))
+                if mode_to_use not in ["generate", "upscale"]:
+                    logging.warning(
+                        f"Invalid mode determined: '{mode_to_use}'. Defaulting to 'generate'."
+                    )
+                    await self.emit_status(
+                        f"⚠️ Invalid mode determined ({mode_to_use}). Defaulting to 'generate'.",
+                        show_in_chat=False,
+                    )
+                    mode_to_use = "generate"
+
+                requested_image_count = extracted_params.get(
+                    "sampleCount", body.get("number_of_images", self.valves.IMAGE_COUNT)
+                )
+
+                aspect_ratio_to_use = self.valves.ASPECT_RATIO.split(" ")[0]
+                requested_aspect_ratio_from_body = body.get(
+                    "aspect_ratio", self.valves.ASPECT_RATIO
+                )
+                aspect_ratio_from_body_parsed = requested_aspect_ratio_from_body.split(
+                    " "
+                )[0]
+                aspect_ratio_to_use = extracted_params.get(
+                    "aspectRatio", aspect_ratio_from_body_parsed
+                )
+
+                negative_prompt_to_use = extracted_params.get(
+                    "negativePrompt", body.get("negative_prompt")
+                )
+
+                enhance_prompt_from_body = body.get("enhance_prompt")
+                enhance_prompt_to_use = extracted_params.get(
+                    "enhancePrompt", enhance_prompt_from_body
+                )
+                if not isinstance(enhance_prompt_to_use, bool):
+                    enhance_prompt_to_use = None  # Default to None, API handles its own defaults if not provided
+
+                add_watermark_from_body = body.get("add_watermark")
+                add_watermark_to_use = extracted_params.get(
+                    "addWatermark", add_watermark_from_body
+                )
+                if not isinstance(add_watermark_to_use, bool):
+                    add_watermark_to_use = (
+                        self.valves.ADD_WATERMARK
+                    )  # Use valve default if not in params/body
+
+                seed_to_use = None
+                # Seed is only for generate mode and not compatible with watermark=True (Imagen 3 limitation)
+                if mode_to_use == "generate":
+                    seed_to_use = extracted_params.get("seed", body.get("seed"))
+                    if not isinstance(seed_to_use, int):
+                        seed_to_use = None
+
+                mime_type_from_body = body.get("output_mime_type")
+                mime_type_to_use = extracted_params.get("mimeType", mime_type_from_body)
+                if mime_type_to_use is None or mime_type_to_use not in [
+                    "image/png",
+                    "image/jpeg",
+                ]:
+                    mime_type_to_use = self.valves.OUTPUT_MIME_TYPE
+
+                quality_from_body = body.get("jpeg_quality")
+                quality_to_use = extracted_params.get("quality", quality_from_body)
+                if not isinstance(quality_to_use, int) or not (
+                    0 <= quality_to_use <= 100
+                ):
+                    quality_to_use = self.valves.JPEG_QUALITY
+
+                upscale_factor_api = extracted_params.get(
+                    "upscaleFactor",
+                    body.get("upscale_factor", self.valves.UPSCALE_FACTOR),
+                )
+                if upscale_factor_api not in ["x2", "x4"]:
+                    upscale_factor_api = (
+                        self.valves.UPSCALE_FACTOR
+                    )  # Use valve default if invalid value
+
+                person_generation_to_use = extracted_params.get(
+                    "personGeneration", self.valves.PERSON_GENERATION
+                )
+                safety_setting_to_use = extracted_params.get(
+                    "safetySetting", self.valves.SAFETY_SETTING
+                )
+
+                # --- Imagen 4 Specific Logic (Conditional Disablement) ---
+                if is_imagen4 and self.valves.DISABLE_UNSUPPORTED_FEATURES_FOR_IMAGEN4:
+                    logging.info(
+                        f"Imagen 4 model '{model_id}' selected. Disabling unsupported features."
+                    )
+
+                    # Disable Upscaling (both simple and generate-then-upscale)
+                    if (
+                        mode_to_use == "upscale"
+                        or upscale_after_generate_factor is not None
+                    ):
+                        await self.emit_status(
+                            f"⚠️ Upscaling (--mode: upscale, --upscale-after-generate) is not supported for {model_id} and has been disabled.",
+                            show_in_chat=False,
+                        )
+                        mode_to_use = "generate"
+                        upscale_after_generate_factor = None
+                        input_image_b64 = (
+                            None  # Ensure no image is sent for upscale mode if disabled
+                        )
+
+                    # Disable Negative Prompt
+                    if negative_prompt_to_use is not None:
+                        await self.emit_status(
+                            f"⚠️ Negative prompt (--negative-prompt) is not supported for {model_id} and has been ignored.",
+                            show_in_chat=False,
+                        )
+                        negative_prompt_to_use = None
+
+                    # Adjust Image Count based on specific Imagen 4 model
+                    max_count_for_imagen4 = 1  # Default for Ultra/Standard
+                    if model_id == "imagen-4.0-fast-generate-preview-06-06":
+                        max_count_for_imagen4 = 4
+
+                    if requested_image_count > max_count_for_imagen4:
+                        await self.emit_status(
+                            f"⚠️ Requested image count ({requested_image_count}) exceeds the maximum ({max_count_for_imagen4}) for {model_id}. Limiting to {max_count_for_imagen4} image(s).",
+                            show_in_chat=False,
+                        )
+                        image_count_to_use = max_count_for_imagen4
+                    else:
+                        image_count_to_use = min(
+                            max(requested_image_count, 1), max_count_for_imagen4
+                        )
+
+                    # Seed is not supported with watermark=True on Imagen 3, Imagen 4 seems to ignore seed regardless
+                    # Keeping existing seed logic for Imagen 3 compatibility, it will be ignored by Imagen 4 API anyway.
+                    # No specific disable needed here, as it's handled by the API.
+
+                else:  # Imagen 3 or Imagen 4 with disable flag False
+                    # Existing Imagen 3 logic for image count
+                    image_count_to_use = (
+                        self.valves.IMAGE_COUNT
+                    )  # Start with valve default
+
+                    # If generate-then-upscale is requested on Imagen 3, force count to 1
+                    if upscale_after_generate_factor is not None:
+                        image_count_to_use = 1
+                        # If user requested > 1, warn them
+                        if requested_image_count > 1:
+                            await self.emit_status(
+                                f"⚠️ Generate-then-upscale only supports 1 image. Requested count ({requested_image_count}) ignored.",
+                                show_in_chat=False,
+                            )
+                    # Otherwise, apply the requested count (from prompt or body) constrained by the 1-4 range
+                    elif mode_to_use == "generate":
+                        image_count_to_use = min(max(requested_image_count, 1), 4)
+
+                # --- Pre-flight Checks ---
+                if (
+                    mode_to_use == "generate"
+                    and add_watermark_to_use is True
+                    and seed_to_use is not None
+                    and not is_imagen4  # This check is only relevant for Imagen 3
+                ):
+                    logging.warning(
+                        "Attempted image generation with both watermark enabled and seed provided."
+                    )
+                    error_message = "Error: Seed is not supported when watermark is enabled by the Imagen API in generate mode (Imagen 3). Please remove either the `--seed:` or the `--add-watermark: true` flag from your prompt, or adjust your valve/extra parameters."
+                    error_status = await self.emit_status(
+                        f"❌ Conflicting parameters", True, True
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream, content=f"{error_status}{error_message}"
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                if (
+                    mode_to_use == "upscale"
+                    and upscale_after_generate_factor is None
+                    and not input_image_b64
+                ):
+                    logging.warning(
+                        "Simple upscale mode requested but no input image found in the message."
+                    )
+                    error_message = "Error: Simple upscale mode (--mode: upscale) requires an image attachment. Please upload the image *first*, then reply to the image with your upscale command (--mode: upscale)."
+                    error_status = await self.emit_status(
+                        f"❌ Input image missing for upscale", True, True
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream, content=f"{error_status}{error_message}"
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                if mode_to_use == "generate" and not prompt:
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content="Error: No valid prompt text provided after parsing parameters for generation.",
+                    )
+                    await self.emit_status("❌ Empty prompt for generation", True, True)
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                if upscale_after_generate_factor is not None and not prompt:
+                    logging.warning(
+                        "Generate-then-upscale mode requested but no prompt found for the initial generation step."
+                    )
+                    error_message = "Error: Generate-then-upscale mode (--upscale-after-generate) requires a text prompt for the initial image generation."
+                    error_status = await self.emit_status(
+                        f"❌ Prompt missing for generate-then-upscale", True, True
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream, content=f"{error_status}{error_message}"
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                if not project_id:
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content="Error: Google Cloud Project ID not provided in Pipe Valves. Please configure your Project ID.",
+                    )
+                    await self.emit_status("❌ Project ID missing", True, True)
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                if not location_id:
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content="Error: Google Cloud Location ID not provided in Pipe Valves. Please configure your Location ID.",
+                    )
+                    await self.emit_status("❌ Location ID missing", True, True)
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                # --- Authentication Refresh ---
+                try:
+                    if not credentials.valid:
+                        credentials.refresh(GoogleAuthRequest())
+                        logging.info("Service Account credentials refreshed.")
+                    access_token = credentials.token
+                    logging.info("Obtained access token.")
+                except Exception as e:
+                    logging.error(f"Failed to obtain access token: {e}", exc_info=True)
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content=f"Error: Failed to obtain access token. Check Service Account permissions. Details: {e}",
+                    )
+                    await self.emit_status("❌ Auth token failed", True, True)
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                # --- Prepare API Calls ---
+                final_url = vertex_ai_url
+                first_call_mode = "generate"
+                # Only simple upscale goes direct to upscale mode on the first call
+                if mode_to_use == "upscale" and upscale_after_generate_factor is None:
+                    first_call_mode = "upscale"
+
+                output_options_first_call = {"mimeType": mime_type_to_use}
+                if mime_type_to_use == "image/jpeg":
+                    output_options_first_call["compressionQuality"] = quality_to_use
+
+                parameters_common_first_call = {
+                    "outputOptions": output_options_first_call,
+                    "addWatermark": add_watermark_to_use,
+                }
+
+                json_data_first_call = {"instances": []}
+
+                if first_call_mode == "generate":
+                    action_description = "image generation"
+                    parameters_first_call = parameters_common_first_call.copy()
+                    parameters_first_call["sampleCount"] = image_count_to_use
+                    parameters_first_call["aspectRatio"] = aspect_ratio_to_use
+                    if negative_prompt_to_use is not None:
+                        parameters_first_call["negativePrompt"] = negative_prompt_to_use
+                    if enhance_prompt_to_use is not None:
+                        parameters_first_call["enhancePrompt"] = enhance_prompt_to_use
+                    if (
+                        seed_to_use is not None
+                    ):  # Note: Imagen 4 ignores seed, but sending it for Imagen 3 compatibility
+                        parameters_first_call["seed"] = seed_to_use
+
+                    if person_generation_to_use is not None:
+                        parameters_first_call["personGeneration"] = (
+                            person_generation_to_use
+                        )
+                    if safety_setting_to_use is not None:
+                        parameters_first_call["safetySetting"] = safety_setting_to_use
+
+                    json_data_first_call["instances"].append({"prompt": prompt})
+                    json_data_first_call["parameters"] = parameters_first_call
+
+                elif first_call_mode == "upscale":
+                    action_description = "image upscaling"
+                    simple_upscale_factor = (
+                        upscale_factor_api  # Use the determined upscale factor
+                    )
+
+                    # Ensure upscale parameters are correctly set for the API call
+                    json_data_first_call = {
+                        "instances": [
+                            {"image": {"bytesBase64Encoded": input_image_b64}}
+                        ],
+                        "parameters": {
+                            "mode": "upscale",
+                            "upscaleConfig": {"upscaleFactor": simple_upscale_factor},
+                            "outputOptions": parameters_common_first_call[
+                                "outputOptions"
+                            ],
+                            "addWatermark": parameters_common_first_call[
+                                "addWatermark"
+                            ],
+                            "sampleCount": 1,  # Upscale is always 1 output image
+                        },
+                    }
+
+                    if not input_image_b64:
+                        logging.error(
+                            "Internal error: Simple upscale mode selected but no input image base64 available after checks."
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content="Internal Error: Missing input image for simple upscale.",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {access_token}",
+                }
+
+                # --- Execute First API Call (Generate or Simple Upscale) ---
+                print(f"Attempt 1/1: Trying Vertex AI URL: {final_url}")
+                log_payload = {
+                    "instances": (
+                        "..." if first_call_mode == "generate" else {"image": "..."}
+                    ),
+                    "parameters": json_data_first_call.get("parameters", {}),
+                }
+                print(
+                    f"Attempt 1 Request JSON (structure and parameters): {json.dumps(log_payload, indent=2)}"
+                )
+                print(
+                    f"Attempt 1 Headers (excluding Auth): Content-Type={headers.get('Content-Type')}"
+                )
+                await self.emit_status(
+                    f"🔄 {action_description.capitalize()} via Vertex AI..."
+                )
+
+                response_first_call = None
+                response_data_first_call = None
+                try:
+                    async with httpx.AsyncClient(timeout=request_timeout) as client:
+                        response_first_call = await client.post(
+                            final_url, json=json_data_first_call, headers=headers
+                        )
+
+                    if response_first_call.status_code != 200:
+                        error_message = f"Error from Vertex AI API during {first_call_mode}: {response_first_call.status_code} - {response_first_call.text}"
+                        first_call_action_word = (
+                            "Generation"
+                            if first_call_mode == "generate"
+                            else "Upscaling"
+                        )
+                        error_status = await self.emit_status(
+                            f"❌ {first_call_action_word} failed", True, True
+                        )
+                        print(
+                            f"Vertex AI API call failed with status {response_first_call.status_code}. Response: {response_first_call.text[:500]}..."
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content=f"{error_status}{error_message}",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+                    print(
+                        f"Vertex AI API call successful for {first_call_mode} with status 200."
+                    )
+                    response_data_first_call = response_first_call.json()
+
+                except httpx.RequestError as e:
+                    logging.error(
+                        f"Vertex AI API Request Error for {first_call_mode} URL: {final_url} - {e}",
+                        exc_info=True,
+                    )
+                    await self.emit_status(
+                        f"❌ Vertex AI API Request Error ({first_call_mode})",
+                        True,
+                        True,
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content=f"❌ Vertex AI API Request Error ({first_call_mode}): {e}",
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+                except json.JSONDecodeError:
+                    error_message = f"Error: Received non-JSON response from Vertex AI API during {first_call_mode}. Status: {response_first_call.status_code if response_first_call else 'Unknown'}, Content: {response_first_call.text[:500] if response_first_call else 'N/A'}..."
+                    error_status = await self.emit_status(
+                        f"❌ Invalid API response format ({first_call_mode})",
+                        True,
+                        True,
+                    )
+                    print(
+                        f"Failed to parse JSON response. Status: {response_first_call.status_code if response_first_call else 'Unknown'}, Content: {response_first_call.text[:500] if response_first_call else 'N/A'}..."
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream, content=f"{error_status}{error_message}"
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+                except (
+                    Exception
+                ) as e:  # Catch any other unexpected errors during the call
+                    logging.error(
+                        f"An unexpected error occurred during the first Vertex AI API call ({first_call_mode}): {e}",
+                        exc_info=True,
+                    )
+                    await self.emit_status(
+                        f"❌ Unexpected API Error ({first_call_mode})", True, True
+                    )
+                    yield self._format_data(
+                        is_stream=is_stream,
+                        content=f"❌ An unexpected error occurred during the first API call ({first_call_mode}): {str(e)}",
+                    )
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True, model=model_id, content=None
+                        )
+                    return
+
+                # --- Handle Generate-then-Upscale (Second API Call) ---
+                response_data = None  # This will hold the final response data
+
+                if (
+                    upscale_after_generate_factor is not None
+                    and first_call_mode == "generate"
+                    and not is_imagen4  # This step only happens for Imagen 3
+                ):
+                    await self.emit_status(
+                        f"🔄 Upscaling generated image (x{upscale_after_generate_factor[1]})..."
+                    )
+                    generated_image_b64 = None
+                    generated_image_mime_type = None
+
+                    # Extract the base64 image from the first response
+                    predictions_first_call = response_data_first_call.get(
+                        "predictions", []
+                    )
+                    if (
+                        predictions_first_call
+                        and isinstance(predictions_first_call[0], dict)
+                        and "bytesBase64Encoded" in predictions_first_call[0]
+                    ):
+                        generated_image_b64 = predictions_first_call[0].get(
+                            "bytesBase64Encoded"
+                        )
+                        generated_image_mime_type = predictions_first_call[0].get(
+                            "mimeType", "image/png"
+                        )
+                    # Fallback check for candidates structure (used by some Gemini/Imagen APIs)
+                    if not generated_image_b64:
+                        candidates_first_call = response_data_first_call.get(
+                            "candidates", []
+                        )
+                        if candidates_first_call and isinstance(
+                            candidates_first_call[0], dict
+                        ):
+                            content_first_call = candidates_first_call[0].get(
+                                "content", {}
+                            )
+                            if isinstance(content_first_call, dict):
+                                parts_first_call = content_first_call.get("parts", [])
+                                for part in parts_first_call:
+                                    if isinstance(part, dict):
+                                        inline_data_first_call = part.get(
+                                            "inlineData", {}
+                                        )
+                                        if isinstance(
+                                            inline_data_first_call, dict
+                                        ) and inline_data_first_call.get(
+                                            "mimeType", ""
+                                        ).startswith(
+                                            "image/"
+                                        ):
+                                            generated_image_b64 = (
+                                                inline_data_first_call.get("data", "")
+                                            )
+                                            generated_image_mime_type = (
+                                                inline_data_first_call.get(
+                                                    "mimeType", "image/png"
+                                                )
+                                            )
+                                            break  # Found the image
+
+                    if not generated_image_b64:
+                        logging.error(
+                            "Failed to extract generated image data from first API call for upscaling."
+                        )
+                        error_message = "Error: Failed to get generated image data from first API call for upscaling."
+                        error_status = await self.emit_status(
+                            f"❌ Upscaling failed (image extraction)", True, True
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content=f"{error_status}{error_message}",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+
+                    # Prepare the JSON payload for the second API call (Upscale)
+                    output_options_second_call = {"mimeType": mime_type_to_use}
+                    if mime_type_to_use == "image/jpeg":
+                        output_options_second_call["compressionQuality"] = (
+                            quality_to_use
+                        )
+
+                    json_data_second_call = {
+                        "instances": [
+                            {"image": {"bytesBase64Encoded": generated_image_b64}}
+                        ],
+                        "parameters": {
+                            "mode": "upscale",
+                            "upscaleConfig": {
+                                "upscaleFactor": upscale_after_generate_factor
+                            },
+                            "outputOptions": output_options_second_call,
+                            "addWatermark": add_watermark_to_use,  # Use the same watermark setting
+                            "sampleCount": 1,  # Upscale always outputs 1 image
+                        },
+                    }
+
+                    # Execute the second API call (Upscale)
+                    response_second_call = None
+                    try:
+                        async with httpx.AsyncClient(timeout=request_timeout) as client:
+                            print(
+                                f"Attempt 1/1: Trying Vertex AI URL (Upscale): {final_url}"
+                            )
+                            log_payload_second_call = {
+                                "instances": {"image": "..."},
+                                "parameters": json_data_second_call.get(
+                                    "parameters", {}
+                                ),
+                            }
+                            print(
+                                f"Attempt 1 Request JSON (Upscale structure and parameters): {json.dumps(log_payload_second_call, indent=2)}"
+                            )
+                            await self.emit_status(
+                                f"🔄 Calling Vertex AI for Upscaling..."
+                            )
+                            response_second_call = await client.post(
+                                final_url,
+                                json=json_data_second_call,
+                                headers=headers,
+                            )
+                        if response_second_call.status_code != 200:
+                            error_message = f"Error from Vertex AI API during upscale: {response_second_call.status_code} - {response_second_call.text}"
+                            error_status = await self.emit_status(
+                                f"❌ Image upscaling failed", True, True
+                            )
+                            print(
+                                f"Vertex AI API call failed with status {response_second_call.status_code}. Response: {response_second_call.text[:500]}..."
+                            )
+                            yield self._format_data(
+                                is_stream=is_stream,
+                                content=f"{error_status}{error_message}",
+                            )
+                            if is_stream:
+                                yield self._format_data(
+                                    is_stream=True, model=model_id, content=None
+                                )
+                            return
+                        print(
+                            f"Vertex AI API call successful for upscale with status 200."
+                        )
+                        response_data = response_second_call.json()
+
+                    except httpx.RequestError as e:
+                        logging.error(
+                            f"Vertex AI API Request Error for Upscale URL: {final_url} - {e}",
+                            exc_info=True,
+                        )
+                        await self.emit_status(
+                            f"❌ Vertex AI API Request Error (Upscaling)", True, True
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content=f"❌ Vertex AI API Request Error (Upscaling): {e}",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+                    except json.JSONDecodeError:
+                        error_message = f"Error: Received non-JSON response from Vertex AI API during upscale. Status: {response_second_call.status_code if response_second_call else 'Unknown'}, Content: {response_second_call.text[:500] if response_second_call else 'N/A'}..."
+                        error_status = await self.emit_status(
+                            f"❌ Invalid API response format (Upscale)", True, True
+                        )
+                        print(
+                            f"Failed to parse JSON response. Status: {response_second_call.status_code if response_second_call else 'Unknown'}, Content: {response_second_call.text[:500] if response_second_call else 'N/A'}..."
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content=f"{error_status}{error_message}",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+                    except (
+                        Exception
+                    ) as e:  # Catch any other unexpected errors during the second call
+                        logging.error(
+                            f"An unexpected error occurred during the second Vertex AI API call (Upscale): {e}",
+                            exc_info=True,
+                        )
+                        await self.emit_status(
+                            f"❌ Unexpected API Error (Upscaling)", True, True
+                        )
+                        yield self._format_data(
+                            is_stream=is_stream,
+                            content=f"❌ An unexpected error occurred during the second API call (Upscaling): {str(e)}",
+                        )
+                        if is_stream:
+                            yield self._format_data(
+                                is_stream=True, model=model_id, content=None
+                            )
+                        return
+
+                else:
+                    # If not doing generate-then-upscale, the first call's response is the final one
+                    response_data = response_data_first_call
+
+                # --- Format and Return Response ---
+                await self.emit_status("✅ Image processing complete!", True)
+
+                image_markdown = []
+                # Vertex AI Imagen API typically returns images in the 'predictions' key
+                predictions = response_data.get("predictions", [])
+                for i, prediction in enumerate(predictions):
+                    if (
+                        isinstance(prediction, dict)
+                        and "bytesBase64Encoded" in prediction
+                    ):
+                        b64_data = prediction.get("bytesBase64Encoded")
+                        # Use the mime type from the prediction if available, otherwise use the chosen one
+                        mime_type = prediction.get("mimeType", mime_type_to_use)
+                        if b64_data:
+                            image_markdown.append(
+                                f"![image_{i+1}](data:{mime_type};base64,{b64_data})"
+                            )
+                    # Some APIs (like Gemini) might return images within a 'candidates' structure
+                    # Keeping this fallback just in case, though 'predictions' is standard for Imagen
+                    elif isinstance(prediction, dict) and "content" in prediction:
+                        content = prediction.get("content", {})
+                        if isinstance(content, dict) and "parts" in content:
+                            parts = content.get("parts", [])
+                            for part in parts:
+                                if isinstance(part, dict) and "inlineData" in part:
+                                    inline_data = part.get("inlineData", {})
+                                    if isinstance(
+                                        inline_data, dict
+                                    ) and inline_data.get("mimeType", "").startswith(
+                                        "image/"
+                                    ):
+                                        b64_data = inline_data.get("data", "")
+                                        if b64_data:
+                                            mime_type = inline_data.get(
+                                                "mimeType", mime_type_to_use
+                                            )
+                                            image_markdown.append(
+                                                f"![image_{i+1}](data:{mime_type};base64,{b64_data})"
+                                            )
+                                            break  # Found the image
+
+                # Also check for other potential image locations in the response,
+                # just for robustness, though 'predictions' is the main one for Imagen
+                # This handles cases where the API response structure might slightly differ
+                images_data_key = response_data.get("data", [])
+                for i, img in enumerate(images_data_key):
+                    if isinstance(img, dict) and "b64_json" in img:
+                        b64_data = img["b64_json"]
+                        mime_type = mime_type_to_use  # Assume format from request/valve
+                        if b64_data:
+                            image_markdown.append(
+                                f"![image_{i+1}](data:{mime_type};base64,{b64_data})"
+                            )
+                    elif isinstance(img, dict) and "url" in img:
+                        # Handle case where API returns a direct URL instead of base64
+                        image_markdown.append(f"![image_{i+1}]({img['url']})")
+
+                images_direct_key = response_data.get("images", [])
+                for i, img in enumerate(images_direct_key):
+                    if isinstance(img, dict) and "base64" in img:
+                        b64_data = img["base64"]
+                        mime_type = mime_type_to_use  # Assume format from request/valve
+                        if b64_data:
+                            image_markdown.append(
+                                f"![image_{i+1}](data:{mime_type};base64,{b64_data})"
+                            )
+                    elif isinstance(img, dict) and "url" in img:
+                        # Handle case where API returns a direct URL instead of base64
+                        image_markdown.append(f"![image_{i+1}]({img['url']})")
+
+                content = "\n\n".join(image_markdown)
+
+                final_action_description = (
+                    action_description  # Use the initial description by default
+                )
+                if upscale_after_generate_factor is not None and not is_imagen4:
+                    final_action_description = f"image generation and upscaling (x{upscale_after_generate_factor[1]})"
+
+                if not image_markdown:
+                    content = f"No images were found in the response. Raw response: ```json\n{json.dumps(response_data, indent=2)}\n```"
+                    await self.emit_status(
+                        f"⚠️ No images found in response.", True, True
+                    )
+                else:
+                    await self.emit_status(
+                        f"✨ {final_action_description.capitalize()} successful!",
+                        True,
+                        True,
+                    )
+
+                if is_stream:
+                    yield self._format_data(
+                        is_stream=True,
+                        model=model_id,
+                        content=content,
+                    )
+                    yield self._format_data(
+                        is_stream=True,
+                        model=model_id,
+                        content=None,
+                        usage=response_data.get("metadata", {}).get(
+                            "usage"
+                        ),  # Imagen API often puts usage in metadata
+                    )
+                else:
+                    yield self._format_data(
+                        is_stream=False,
+                        model=model_id,
+                        content=content,
+                        usage=response_data.get("metadata", {}).get(
+                            "usage"
+                        ),  # Imagen API often puts usage in metadata
+                    )
+
+            except Exception as err:
+                logging.error(
+                    f"An unexpected error occurred in the pipe: {err}", exc_info=True
+                )
+                error_status = await self.emit_status(
+                    f"❌ An unexpected error occurred", True, True
+                )
+                yield self._format_data(
+                    is_stream=body.get("stream", False),
+                    content=f"{error_status}Error processing image request: {str(err)}",
+                )
+                if body.get("stream", False):
+                    yield self._format_data(
+                        is_stream=True, model=model_id, content=None
+                    )
+
+        return StreamingResponse(stream_response())
+
+    def _format_data(
+        self,
+        is_stream: bool,
+        model: str = "",
+        content: Optional[str] = "",
+        usage: Optional[dict] = None,
+    ) -> str:
+        """Format the response data in the expected OpenAI-like format."""
+        response_id = f"chat.{uuid.uuid4().hex}"
+        object_type = "chat.completion.chunk" if is_stream else "chat.completion"
+        created_time = int(time.time())
+
+        data = {
+            "id": response_id,
+            "object": object_type,
+            "created": created_time,
+            "model": model,
+        }
+
+        choices = []
+        if content is not None:
+            choice_content = {"role": "assistant", "content": content}
+            if is_stream:
+                choice_delta = choice_content
+                choice_message = None
+            else:
+                choice_delta = None
+                choice_message = choice_content
+            choices.append(
+                {
+                    "finish_reason": (
+                        "stop" if not is_stream and content is not None else None
+                    ),
+                    "index": 0,
+                    "delta": choice_delta,
+                    "message": (
+                        choice_content if not is_stream else choice_delta
+                    ),  # Use message key for non-stream
+                }
+            )
+        elif is_stream and content is None:
+            # This is the final chunk for a stream
+            choices.append(
+                {
+                    "finish_reason": "stop",
+                    "index": 0,
+                    "delta": {},  # Empty delta signals end of content stream
+                    "message": None,  # No message for final chunk
+                }
+            )
+        # If content is None and not stream, it's likely an error path that didn't yield text,
+        # but we still might want to send an empty message or similar.
+        # The current error handling yields text content directly, so this case is less likely for errors.
+
+        data["choices"] = choices
+
+        if usage:
+            data["usage"] = usage
+
+        if is_stream:
+            return f"data: {json.dumps(data)}\n\n"
+        else:
+            return json.dumps(data)
+
+
+pipe = Pipe()
